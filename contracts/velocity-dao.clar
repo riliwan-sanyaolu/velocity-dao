@@ -187,3 +187,110 @@
     (mint-tokens tx-sender amount)
   )
 )
+
+;; Withdraw STX after lock period expires
+(define-public (withdraw (amount uint))
+  (begin
+    (try! (check-initialized))
+    (asserts! (> amount u0) err-zero-amount)
+    (let (
+        (deposit-info (unwrap! (map-get? deposits tx-sender) err-unauthorized))
+        (user-balance (unwrap! (get-balance tx-sender) err-unauthorized))
+      )
+      (asserts! (>= stacks-block-height (get lock-until deposit-info))
+        err-locked-period
+      )
+      (asserts! (>= user-balance amount) err-insufficient-balance)
+      ;; Burn governance tokens first
+      (try! (burn-tokens tx-sender amount))
+      ;; Transfer STX back to user
+      (as-contract (stx-transfer? amount (as-contract tx-sender) tx-sender))
+    )
+  )
+)
+
+;; Create new investment proposal
+(define-public (create-proposal
+    (description (string-ascii 256))
+    (amount uint)
+    (target principal)
+    (duration uint)
+  )
+  (begin
+    (try! (check-initialized))
+    ;; Comprehensive input validation
+    (asserts! (> (len description) u0) err-invalid-description)
+    (asserts! (> amount u0) err-zero-amount)
+    (asserts! (not (is-eq target (as-contract tx-sender))) err-invalid-target)
+    (asserts! (and (>= duration minimum-duration) (<= duration maximum-duration))
+      err-invalid-duration
+    )
+    (let (
+        (proposer-balance (unwrap! (map-get? balances tx-sender) err-unauthorized))
+        (proposal-id (+ (var-get proposal-count) u1))
+      )
+      (asserts! (> proposer-balance u0) err-unauthorized)
+      ;; Create new proposal with validated inputs
+      (map-set proposals proposal-id {
+        proposer: tx-sender,
+        description: description,
+        amount: amount,
+        target: target,
+        expires-at: (+ stacks-block-height duration),
+        executed: false,
+        yes-votes: u0,
+        no-votes: u0,
+      })
+      (var-set proposal-count proposal-id)
+      (ok proposal-id)
+    )
+  )
+)
+
+;; Vote on active proposal with weighted voting
+(define-public (vote
+    (proposal-id uint)
+    (vote-for bool)
+  )
+  (begin
+    (try! (check-initialized))
+    (try! (validate-proposal-id proposal-id))
+    (let (
+        (proposal (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
+        (voter-power (calculate-voting-power tx-sender))
+      )
+      (asserts! (> voter-power u0) err-unauthorized)
+      (asserts! (< stacks-block-height (get expires-at proposal))
+        err-proposal-expired
+      )
+      (asserts!
+        (is-none (map-get? votes {
+          proposal-id: proposal-id,
+          voter: tx-sender,
+        }))
+        err-already-voted
+      )
+      ;; Record vote after all validations pass
+      (map-set votes {
+        proposal-id: proposal-id,
+        voter: tx-sender,
+      }
+        vote-for
+      )
+      ;; Update vote counts with weighted voting power
+      (map-set proposals proposal-id
+        (merge proposal {
+          yes-votes: (if vote-for
+            (+ (get yes-votes proposal) voter-power)
+            (get yes-votes proposal)
+          ),
+          no-votes: (if vote-for
+            (get no-votes proposal)
+            (+ (get no-votes proposal) voter-power)
+          ),
+        })
+      )
+      (ok true)
+    )
+  )
+)
